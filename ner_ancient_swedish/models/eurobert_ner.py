@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from torch.nn.utils.rnn import pad_sequence
+from transformers import AutoModel
 
 class EUROBERT_NER(nn.Module):
     def __init__(self, model_name, num_labels, hidden_dim=128,
@@ -12,7 +13,9 @@ class EUROBERT_NER(nn.Module):
         self.model_name = model_name
         self.num_labels = num_labels
         self.hidden_dim = hidden_dim
-    
+        self.model = AutoModel.from_pretrained(model_checkpoint)
+        self.dropout = nn.Dropout(0.1)
+        
     def forward(self, input_ids, attention_mask=None):
         # input_ids: [batch_size, seq_len]
         # attention_mask: [batch_size, seq_len]
