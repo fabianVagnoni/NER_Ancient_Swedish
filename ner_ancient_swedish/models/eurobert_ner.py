@@ -7,10 +7,10 @@ from transformers import AutoModel
 from sklearn.metrics import precision_recall_fscore_support, accuracy_score
 from tqdm import tqdm
 
-class SIMPLE_EUROBERT_NER(nn.Module):
+class EUROBERT_NER(nn.Module):
     def __init__(self, model_name, num_labels, hidden_dim=128,
                  model_checkpoint="EuroBERT/EuroBERT-610m"):
-        super(SIMPLE_EUROBERT_NER, self).__init__()
+        super(EUROBERT_NER, self).__init__()
         self.model_checkpoint = model_checkpoint
         self.model_name = model_name
         self.num_labels = num_labels
@@ -49,6 +49,7 @@ class SIMPLE_EUROBERT_NER(nn.Module):
             finetune_after_epoch: after which epoch to start fine-tuning the pretrained model
             device: device to train on ('cuda' or 'cpu')
         """
+
         self.to(device)
         criterion = nn.CrossEntropyLoss(ignore_index=-100)  # Ignore padding tokens
         best_f1 = 0.0
