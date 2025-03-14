@@ -29,7 +29,7 @@ class EUROBERT_NER(nn.Module):
         logits = self.fc(sequence_output)  # [batch_size, seq_len, num_labels]
         return logits
 
-    def train(self, train_loader, val_loader, 
+    def fit(self, train_loader, val_loader, 
               num_epochs=10, 
               initial_lr=1e-3, 
               finetune_lr=5e-5, 
