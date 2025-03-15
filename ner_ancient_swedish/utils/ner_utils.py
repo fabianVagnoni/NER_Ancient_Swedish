@@ -49,8 +49,11 @@ def map_labels_to_ids(example, label_map):
     return example
 
 
-def tokenize_and_align_labels(examples, tokenizer):
-    tokenized_inputs = tokenizer(examples["text"], truncation=True, is_split_into_words=True)
+def tokenize_and_align_labels(examples, tokenizer,max_len):
+    tokenized_inputs = tokenizer(examples["text"], 
+                                 truncation=True, 
+                                 max_length=max_len,
+                                 is_split_into_words=True)
 
     labels = []
     for i, label in enumerate(examples["labels"]):
@@ -70,4 +73,4 @@ def tokenize_and_align_labels(examples, tokenizer):
         labels.append(label_ids)
 
     tokenized_inputs["labels"] = labels
-    return tokenized_inputs 
+    return tokenized_inputs

@@ -6,6 +6,8 @@ from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoModel
 from sklearn.metrics import precision_recall_fscore_support, accuracy_score
 from tqdm import tqdm
+# Import the custom evaluation function
+from ner_ancient_swedish.utils.evaluation_utils import compute_metrics
 
 class EUROBERT_NER(nn.Module):
     def __init__(self, model_name, num_labels, hidden_dim=128,
@@ -34,7 +36,8 @@ class EUROBERT_NER(nn.Module):
               initial_lr=1e-3, 
               finetune_lr=5e-5, 
               finetune_after_epoch=3, 
-              device='cuda'):
+              device='cuda',
+              label_list=None):
         """
         Two-phase training strategy:
         1. First phase: Freeze pretrained model, train only the classification head
@@ -48,6 +51,7 @@ class EUROBERT_NER(nn.Module):
             finetune_lr: learning rate for the second phase (full model fine-tuning)
             finetune_after_epoch: after which epoch to start fine-tuning the pretrained model
             device: device to train on ('cuda' or 'cpu')
+            label_list: list of label names corresponding to label indices
         """
 
         self.to(device)
@@ -81,7 +85,7 @@ class EUROBERT_NER(nn.Module):
             self.train_epoch(train_loader, optimizer, criterion, device, epoch)
             
             # Validation
-            val_metrics = self.evaluate(val_loader, criterion, device)
+            val_metrics = self.evaluate(val_loader, criterion, device, label_list)
             
             print(f"Validation metrics: " + 
                   f"Loss: {val_metrics['loss']:.4f}, " +
@@ -134,17 +138,159 @@ class EUROBERT_NER(nn.Module):
         print(f"Training Loss: {avg_loss:.4f}")
         return avg_loss
 
-    def evaluate(self, val_loader, criterion=None, device='cuda'):
+    def evaluate(self, val_loader, criterion=None, device='cuda', label_list=None):
         """
-        Evaluate the model on validation data
+        Evaluate the model on validation data using custom evaluation metrics
         
         Args:
             val_loader: DataLoader for validation set
             criterion: loss function (if None, only metrics are computed)
             device: device to evaluate on
+            label_list: list of label names corresponding to label indices
             
         Returns:
             dict: metrics including accuracy, precision, recall, F1 score
+        """
+        if label_list is None:
+            # Fallback to default evaluation if label_list is not provided
+            return self._evaluate_default(val_loader, criterion, device)
+            
+        self.eval()
+        total_loss = 0.0
+        all_predictions = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc="Evaluating"):
+                # Move batch to device
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                labels = batch['labels'].to(device)
+                
+                # Forward pass
+                logits = self(input_ids, attention_mask)
+                
+                # Calculate loss if criterion is provided
+                if criterion:
+                    active_loss = attention_mask.view(-1) == 1
+                    active_logits = logits.view(-1, self.num_labels)
+                    active_labels = torch.where(
+                        active_loss, 
+                        labels.view(-1), 
+                        torch.tensor(criterion.ignore_index).type_as(labels)
+                    )
+                    
+                    loss = criterion(active_logits, active_labels)
+                    total_loss += loss.item()
+                
+                # Process each batch item individually
+                batch_preds = torch.argmax(logits, dim=2).cpu().numpy()
+                batch_labels = labels.cpu().numpy()
+                
+                all_predictions.extend(batch_preds)
+                all_labels.extend(batch_labels)
+        
+        # Prepare metrics
+        metrics = {}
+        if criterion:
+            metrics['loss'] = total_loss / len(val_loader)
+        
+        # Remove ignored index (special tokens)
+        true_predictions = [
+            [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(all_predictions, all_labels)
+        ]
+        
+        true_labels = [
+            [label_list[l] for (p, l) in zip(prediction, label) if l != -100]
+            for prediction, label in zip(all_predictions, all_labels)
+        ]
+        
+        # Calculate token-level accuracy
+        token_accuracy = self._calculate_token_accuracy(true_labels, true_predictions)
+        metrics['accuracy'] = token_accuracy
+        
+        # Convert to nervaluate format (list of entities with start/end positions)
+        true_entities = []
+        pred_entities = []
+        
+        for doc_true_labels, doc_true_preds in zip(true_labels, true_predictions):
+            # Process ground truth entities
+            doc_entities = []
+            current_entity = None
+            
+            for i, label in enumerate(doc_true_labels):
+                if label == 'O' and current_entity:
+                    doc_entities.append(current_entity)
+                    current_entity = None
+                elif label != 'O' and (current_entity is None or current_entity['label'] != label):
+                    if current_entity:
+                        doc_entities.append(current_entity)
+                    current_entity = {'label': label, 'start': i, 'end': i}
+                elif label != 'O' and current_entity and current_entity['label'] == label:
+                    current_entity['end'] = i
+            
+            if current_entity:
+                doc_entities.append(current_entity)
+            
+            true_entities.append(doc_entities)
+            
+            # Process predicted entities
+            doc_entities = []
+            current_entity = None
+            
+            for i, label in enumerate(doc_true_preds):
+                if label == 'O' and current_entity:
+                    doc_entities.append(current_entity)
+                    current_entity = None
+                elif label != 'O' and (current_entity is None or current_entity['label'] != label):
+                    if current_entity:
+                        doc_entities.append(current_entity)
+                    current_entity = {'label': label, 'start': i, 'end': i}
+                elif label != 'O' and current_entity and current_entity['label'] == label:
+                    current_entity['end'] = i
+            
+            if current_entity:
+                doc_entities.append(current_entity)
+            
+            pred_entities.append(doc_entities)
+        
+        # Create evaluator and compute metrics
+        from nervaluate import Evaluator
+        evaluator = Evaluator(true_entities, pred_entities, tags=list(set(label_list) - {'O'}))
+        results_all = evaluator.evaluate()
+        
+        results = results_all[0]  # Overall results
+        results_per_tag = results_all[1]  # Results per tag
+        
+        # Extract overall metrics
+        metrics['precision'] = results['strict']['precision']
+        metrics['recall'] = results['strict']['recall']
+        metrics['f1'] = results['strict']['f1']
+        
+        # Print per-tag results
+        print("\nResults per entity type:")
+        for key, value in results_per_tag.items():
+            print(f"{key}: {results_per_tag[key]['strict']}")
+        
+        return metrics
+    
+    def _calculate_token_accuracy(self, true_labels, true_predictions):
+        """Calculate token-level accuracy"""
+        correct = 0
+        total = 0
+        
+        for doc_labels, doc_preds in zip(true_labels, true_predictions):
+            for label, pred in zip(doc_labels, doc_preds):
+                if label == pred:
+                    correct += 1
+                total += 1
+        
+        return correct / total if total > 0 else 0
+
+    def _evaluate_default(self, val_loader, criterion=None, device='cuda'):
+        """
+        Original evaluation method using token-level metrics (fallback method)
         """
         self.eval()
         total_loss = 0.0
@@ -204,27 +350,36 @@ class EUROBERT_NER(nn.Module):
         
         return metrics
 
-    def predict(self, test_loader, device='cuda'):
+    def predict(self, test_loader, device='cuda', label_list=None):
         """
         Generate predictions for test data
         
         Args:
             test_loader: DataLoader for test set
             device: device to predict on
+            label_list: list of label names corresponding to label indices
             
         Returns:
             list: predictions for each token in the test set
             list: token ids from the input (for mapping back to original text)
+            dict: metrics if labels are provided in the test_loader
         """
         self.eval()
         all_predictions = []
         all_token_ids = []
+        all_labels = []
+        has_labels = False
         
         with torch.no_grad():
             for batch in tqdm(test_loader, desc="Predicting"):
                 # Move batch to device
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
+                
+                # Check if labels are provided
+                if 'labels' in batch:
+                    has_labels = True
+                    labels = batch['labels'].to(device)
                 
                 # Forward pass
                 logits = self(input_ids, attention_mask)
@@ -238,5 +393,94 @@ class EUROBERT_NER(nn.Module):
                     
                     all_predictions.append(active_preds)
                     all_token_ids.append(active_ids)
+                
+                # Store labels if available
+                if has_labels:
+                    batch_labels = labels.cpu().numpy()
+                    all_labels.extend([labels[i, mask == 1].cpu().numpy() for i, mask in enumerate(attention_mask)])
+        
+        # If we have labels and a label list, compute metrics
+        if has_labels and label_list is not None:
+            # Remove ignored index (special tokens)
+            true_predictions = [
+                [label_list[p] for (p, l) in zip(prediction, label) if l != -100]
+                for prediction, label in zip(all_predictions, all_labels)
+            ]
+            
+            true_labels = [
+                [label_list[l] for (p, l) in zip(prediction, label) if l != -100]
+                for prediction, label in zip(all_predictions, all_labels)
+            ]
+            
+            # Calculate token-level accuracy
+            token_accuracy = self._calculate_token_accuracy(true_labels, true_predictions)
+            
+            # Convert to nervaluate format (list of entities with start/end positions)
+            true_entities = []
+            pred_entities = []
+            
+            for doc_true_labels, doc_true_preds in zip(true_labels, true_predictions):
+                # Process ground truth entities
+                doc_entities = []
+                current_entity = None
+                
+                for i, label in enumerate(doc_true_labels):
+                    if label == 'O' and current_entity:
+                        doc_entities.append(current_entity)
+                        current_entity = None
+                    elif label != 'O' and (current_entity is None or current_entity['label'] != label):
+                        if current_entity:
+                            doc_entities.append(current_entity)
+                        current_entity = {'label': label, 'start': i, 'end': i}
+                    elif label != 'O' and current_entity and current_entity['label'] == label:
+                        current_entity['end'] = i
+                
+                if current_entity:
+                    doc_entities.append(current_entity)
+                
+                true_entities.append(doc_entities)
+                
+                # Process predicted entities
+                doc_entities = []
+                current_entity = None
+                
+                for i, label in enumerate(doc_true_preds):
+                    if label == 'O' and current_entity:
+                        doc_entities.append(current_entity)
+                        current_entity = None
+                    elif label != 'O' and (current_entity is None or current_entity['label'] != label):
+                        if current_entity:
+                            doc_entities.append(current_entity)
+                        current_entity = {'label': label, 'start': i, 'end': i}
+                    elif label != 'O' and current_entity and current_entity['label'] == label:
+                        current_entity['end'] = i
+                
+                if current_entity:
+                    doc_entities.append(current_entity)
+                
+                pred_entities.append(doc_entities)
+            
+            # Create evaluator and compute metrics
+            from nervaluate import Evaluator
+            evaluator = Evaluator(true_entities, pred_entities, tags=list(set(label_list) - {'O'}))
+            results_all = evaluator.evaluate()
+            
+            results = results_all[0]  # Overall results
+            results_per_tag = results_all[1]  # Results per tag
+            
+            # Create metrics dict
+            metrics = {
+                'accuracy': token_accuracy,
+                'precision': results['strict']['precision'],
+                'recall': results['strict']['recall'],
+                'f1': results['strict']['f1']
+            }
+            
+            # Print per-tag results
+            print("\nResults per entity type:")
+            for key, value in results_per_tag.items():
+                print(f"{key}: {results_per_tag[key]['strict']}")
+            
+            return all_predictions, all_token_ids, metrics
         
         return all_predictions, all_token_ids
