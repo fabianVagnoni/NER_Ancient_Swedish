@@ -11,16 +11,29 @@ from ner_ancient_swedish.utils.evaluation_utils import compute_metrics
 # Import custom loss functions
 from ner_ancient_swedish.models.loss_functions import FocalLoss, LabelSmoothingCrossEntropy, DiceLoss
 
-class EUROBERT_NER(nn.Module):
-    def __init__(self, model_name, num_labels, hidden_dim=128,
+class EUROBERT_LSTM(nn.Module):
+    def __init__(self, model_name, 
+                 num_labels, 
+                 hidden_dim=128,
+                 bidirectional=True,
+                 num_layers=2,
                  model_checkpoint="EuroBERT/EuroBERT-610m"):
-        super(EUROBERT_NER, self).__init__()
+        super(EUROBERT_LSTM, self).__init__()
         self.model_checkpoint = model_checkpoint
         self.model_name = model_name
         self.num_labels = num_labels
         self.hidden_dim = hidden_dim
         self.model = AutoModel.from_pretrained(model_checkpoint)
-        self.fc = nn.Linear(self.model.config.hidden_size, num_labels)
+        self.lstm = nn.LSTM(self.model.config.hidden_size,
+                             hidden_dim, 
+                             batch_first=True,
+                             num_layers=num_layers,
+                             bidirectional=bidirectional)
+        if bidirectional:
+            self.fc = nn.Linear(hidden_dim*2, num_labels)
+        else:
+            self.fc = nn.Linear(hidden_dim, num_labels)
+        self.bidirectional = bidirectional
         self.dropout = nn.Dropout(0.1)
         
     def forward(self, input_ids, attention_mask=None):
@@ -30,7 +43,14 @@ class EUROBERT_NER(nn.Module):
         outputs = self.model(input_ids, attention_mask=attention_mask)
         sequence_output = outputs.last_hidden_state  # [batch_size, seq_len, hidden_size]
         sequence_output = self.dropout(sequence_output)
-        logits = self.fc(sequence_output)  # [batch_size, seq_len, num_labels]
+        lstm_output, _ = self.lstm(sequence_output)
+        lstm_output = self.dropout(lstm_output)
+        if self.bidirectional:
+            lstm_output = lstm_output[:, :, :self.hidden_dim] + lstm_output[:, :, self.hidden_dim:]
+            lstm_output = lstm_output.contiguous().view(lstm_output.size(0), -1, self.hidden_dim)
+        else:
+            lstm_output = lstm_output[:, :, :self.hidden_dim]
+        logits = self.fc(lstm_output)
         return logits
 
     def fit(self, train_loader, val_loader, 
