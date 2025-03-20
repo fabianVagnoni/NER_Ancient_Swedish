@@ -101,3 +101,4 @@ def calculate_token_accuracy(true_labels, true_predictions):
             total += 1
 
     return correct / total if total > 0 else 0
+

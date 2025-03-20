@@ -1,468 +1,274 @@
+import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from collections import Counter, defaultdict
-import torch
-from torch.utils.data import TensorDataset, DataLoader
+from collections import Counter
+import json
+import ast
 
-def stratified_ner_split(texts, labels, val_size=0.2, random_state=42):
-    """
-    Create a stratified split for NER data by ensuring proper entity distribution.
+# First, ensure entities column contains proper Python objects
+def parse_entities(entities):
+    if isinstance(entities, str):
+        try:
+            return json.loads(entities)
+        except json.JSONDecodeError:
+            try:
+                entities = entities.replace("\n", ',')
+                return ast.literal_eval(entities)
+            except (ValueError, SyntaxError):
+                return []
+    return entities if isinstance(entities, list) else []
+
+
+# Create a column with entity category distribution for stratification
+def get_entity_distribution(entities_list):
+    counts = Counter()
+    for entity in entities_list:
+        counts[entity['label']] += 1
+    return counts
+
+
+# Create stratification labels based on the most dominant entity type
+# or a combination of entity types when multiple are present
+def create_strat_label(entity_counts):
     
-    Args:
-        texts: List of tokenized texts or input_ids
-        labels: List of token labels corresponding to texts (can be strings or numeric indices)
-        val_size: Proportion of validation set size
-        random_state: Random seed for reproducibility
+    # For samples with multiple entity types, use the most frequent ones
+    sorted_entities = sorted(entity_counts.items(), key=lambda x: (-x[1], x[0]))
+    
+    # Get the dominant entity type(s)
+    dominant_count = sorted_entities[0][1]
+    dominant_types = [e_type for e_type, count in sorted_entities if count == dominant_count]
+    
+    # Create a composite label for stratification
+    return "_".join(sorted(dominant_types))
+
+
+# Create a combined stratification feature based on weak entities
+def create_weak_entity_signature(row, weak_entities, entity_frequency):
+    """
+    Create a stratification signature based on the rarest entity in each text.
+    
+    Parameters:
+    -----------
+    row : pandas.Series
+        Row containing binary indicators for weak entities
+    weak_entities : list
+        List of weak entity types
+    entity_frequency : dict
+        Dictionary mapping entity types to their frequencies
         
     Returns:
-        train_texts, val_texts, train_labels, val_labels
+    --------
+    str
+        Stratification signature based on the rarest entity
     """
-    # Handle empty dataset or single example
-    if len(texts) <= 1:
-        raise ValueError("Dataset must contain at least 2 examples for splitting")
+    # Check which weak entities are present in this text
+    present_entities = []
+    for entity in weak_entities:
+        column_name = f"has_{entity.replace('-', '_')}"
+        if row[column_name] == 1:
+            present_entities.append(entity)
     
-    # Calculate entity distributions per document
-    doc_entity_counts = []
-    entity_types = set()
+    if not present_entities:
+        return "no_weak_entities"
     
-    for doc_labels in labels:
-        # Skip empty documents
-        if len(doc_labels) == 0:
-            doc_entity_counts.append(Counter())
-            continue
-            
-        # Handle both string labels and numeric indices
-        if isinstance(doc_labels[0], (int, np.integer)) or (hasattr(doc_labels[0], 'item') and isinstance(doc_labels[0].item(), (int, np.integer))):
-            # For numeric labels, we can't directly identify 'O' (background), 
-            # so we'll assume label 0 is the background class (common convention)
-            entity_counter = Counter([label for label in doc_labels if label != 0 and label != -100])
-        else:
-            # For string labels, exclude 'O' (outside/background) labels
-            entity_counter = Counter([label for label in doc_labels if label != 'O' and label != -100])
-        
-        doc_entity_counts.append(entity_counter)
-        entity_types.update(entity_counter.keys())
+    # Sort present entities by frequency (prioritize the rarest)
+    present_entities.sort(key=lambda e: entity_frequency[e])
     
-    # If no entity types found, fall back to random split
-    if not entity_types:
-        print("Warning: No entity types found for stratification. Falling back to random split.")
-        indices = np.arange(len(texts))
-        np.random.seed(random_state)
-        np.random.shuffle(indices)
-        split_idx = int(len(indices) * (1 - val_size))
-        train_indices = indices[:split_idx]
-        val_indices = indices[split_idx:]
-    else:
-        # Create document features based on entity distribution
-        entity_types = sorted(list(entity_types))
-        doc_features = np.zeros((len(texts), len(entity_types)))
-        
-        for i, counter in enumerate(doc_entity_counts):
-            for j, entity_type in enumerate(entity_types):
-                # Get count of this entity type and normalize by document length
-                doc_features[i, j] = counter.get(entity_type, 0) / max(1, len([l for l in labels[i] if l != -100]))
-        
-        # Compute document weights to prioritize rare entities
-        entity_type_counts = Counter()
-        for counter in doc_entity_counts:
-            entity_type_counts.update(counter)
-        
-        # Calculate inverse frequency weights for entity types
-        total_entities = sum(entity_type_counts.values())
-        entity_weights = {entity: total_entities / max(1, count) for entity, count in entity_type_counts.items()}
-        
-        # Calculate weighted importance score for each document
-        doc_importance = np.zeros(len(texts))
-        for i, counter in enumerate(doc_entity_counts):
-            score = sum(counter.get(entity, 0) * entity_weights.get(entity, 1) for entity in entity_types)
-            doc_importance[i] = score
-        
-        # Use importance scores to influence the stratification
-        # Create balanced groups for stratification
-        n_groups = min(5, len(texts))  # Number of strata, but not more than dataset size
-        doc_groups = np.zeros(len(texts), dtype=int)
-        
-        # Sort documents by importance and assign to groups in round-robin fashion
-        sorted_indices = np.argsort(doc_importance)
-        for i, idx in enumerate(sorted_indices):
-            doc_groups[idx] = i % n_groups
-        
-        # Perform stratified split based on the assigned groups
-        train_indices, val_indices = train_test_split(
-            np.arange(len(texts)),
-            test_size=val_size,
-            random_state=random_state,
-            stratify=doc_groups
-        )
-    
-    # Create the split datasets
-    train_texts = [texts[i] for i in train_indices]
-    val_texts = [texts[i] for i in val_indices]
-    train_labels = [labels[i] for i in train_indices]
-    val_labels = [labels[i] for i in val_indices]
-    
-    # Verify entity distribution in train and validation sets
-    train_entity_counts = sum_entity_counts([doc_entity_counts[i] for i in train_indices])
-    val_entity_counts = sum_entity_counts([doc_entity_counts[i] for i in val_indices])
-    
-    print("Entity distribution in training set:")
-    for entity, count in train_entity_counts.items():
-        print(f"  {entity}: {count}")
-    
-    print("\nEntity distribution in validation set:")
-    for entity, count in val_entity_counts.items():
-        print(f"  {entity}: {count}")
-    
-    return train_texts, val_texts, train_labels, val_labels
+    # Return the rarest entity as the signature
+    return f"has_{present_entities[0]}"
 
-def sum_entity_counts(doc_entity_counts):
-    """Sum entity counts across multiple documents."""
-    total_counts = Counter()
-    for counter in doc_entity_counts:
-        total_counts.update(counter)
-    return total_counts
 
-def compute_class_weights(labels, num_classes=None, label_map=None):
+def create_stratified_train_test_split(label_list, dataset, weak_entity_threshold=300, test_size=0.2, random_state=42):
     """
-    Compute class weights for imbalanced NER data.
+    Create a stratified train-test split of the dataset based on entity categories.
+    Ensures that rare/weak entities are properly distributed between train and test sets.
     
-    Args:
-        labels: List of label sequences (can be strings or numeric indices)
-        num_classes: Total number of classes (if not provided, will be inferred)
-        label_map: Optional mapping from label names to indices
-        
+    Parameters:
+    -----------
+    label_list : list
+        List of entity categories to stratify by
+    dataset : pandas.DataFrame
+        DataFrame containing the text and entities columns
+    weak_entity_threshold : int, optional
+        Threshold below which an entity is considered 'weak/rare'
+    test_size : float, optional
+        Proportion of the dataset to include in the test split
+    random_state : int, optional
+        Random seed for reproducibility
+    
     Returns:
-        torch.Tensor: Weights for each class, can be used in loss functions
+    --------
+    train_dataset : pandas.DataFrame
+        Training dataset
+    test_dataset : pandas.DataFrame
+        Testing dataset
     """
-    import torch
-    from collections import Counter
     
-    # Flatten all labels and count occurrences
-    all_labels = []
-    for doc_labels in labels:
-        if len(doc_labels) == 0:
-            continue
-            
-        # Handle both string and numeric labels
-        if isinstance(doc_labels[0], str):
-            # For string labels, convert to indices if label_map is provided
-            if label_map:
-                doc_labels = [label_map.get(l, -100) for l in doc_labels]
-        
-        all_labels.extend([l for l in doc_labels if l != -100])  # Exclude padding
+    # Create a stratification column based on entity distribution
+    dataset = dataset.copy()
     
-    # Count label occurrences
-    label_counts = Counter(all_labels)
+    # Convert string representations to proper Python objects
+    dataset['entities'] = dataset['entities'].apply(parse_entities)
     
-    # Infer number of classes if not provided
-    if num_classes is None:
-        if label_map:
-            num_classes = len(label_map)
-        else:
-            num_classes = max(label_counts.keys()) + 1 if label_counts else 1
-    
-    # Compute inverse frequency weights
-    total_samples = sum(label_counts.values())
-    class_weights = torch.ones(num_classes)
-    
-    for label, count in label_counts.items():
-        if isinstance(label, str) and label_map:
-            # Convert string label to index using label_map
-            label_idx = label_map[label]
-        else:
-            label_idx = label
-        
-        # Inverse frequency weighting (higher weight for less frequent classes)
-        class_weights[label_idx] = total_samples / (count * num_classes)
-    
-    # Normalize weights
-    if class_weights.sum() > 0:
-        class_weights = class_weights / class_weights.sum() * num_classes
-    
-    return class_weights
+    dataset['entity_counts'] = dataset['entities'].apply(get_entity_distribution)
 
-def generate_stratified_data_splits(texts, labels, val_size=0.2, test_size=0.1, random_state=42):
-    """
-    Generate train, validation, and test splits with stratification for NER data.
+    # Get overall counts of each entity type
+    overall_counts = Counter()
+    for entity_counts in dataset['entity_counts']:
+        overall_counts.update(entity_counts)
+    print("Overall counts:")
+    print(overall_counts)
     
-    Args:
-        texts: List of tokenized texts or input_ids
-        labels: List of token labels corresponding to texts
-        val_size: Proportion of validation set size relative to the whole dataset
-        test_size: Proportion of test set size relative to the whole dataset
-        random_state: Random seed for reproducibility
-        
-    Returns:
-        train_texts, val_texts, test_texts, train_labels, val_labels, test_labels
-    """
-    # First split off the test set
-    train_val_texts, test_texts, train_val_labels, test_labels = stratified_ner_split(
-        texts, labels, val_size=test_size, random_state=random_state
+    # Identify weak entities (those with fewer occurrences than the threshold)
+    # Sort them by frequency (ascending) to prioritize the rarest entities
+    weak_entities = [entity for entity, count in overall_counts.items() 
+                    if count < weak_entity_threshold]
+    # Sort weak entities by frequency (ascending)
+    weak_entities.sort(key=lambda e: overall_counts[e])
+    
+    print(f"\nWeak entities (count < {weak_entity_threshold}), sorted by rarity:")
+    for entity in weak_entities:
+        print(f"{entity}: {overall_counts[entity]}")
+    
+    # Create binary features for each weak entity
+    for entity in weak_entities:
+        column_name = f"has_{entity.replace('-', '_')}"
+        dataset[column_name] = dataset['entity_counts'].apply(lambda x: 1 if entity in x else 0)
+    
+    print("\nTexts containing each weak entity:")
+    for entity in weak_entities:
+        column_name = f"has_{entity.replace('-', '_')}"
+        count = dataset[column_name].sum()
+        print(f"{entity}: {count} texts ({count/len(dataset)*100:.2f}%)")
+    
+    # Create a stratification signature based on the rarest entity in each text
+    dataset['weak_entity_signature'] = dataset.apply(
+        lambda row: create_weak_entity_signature(row, weak_entities, overall_counts), 
+        axis=1
     )
     
-    # Then split the remaining data into train and validation sets
-    # Adjust val_size to account for already removed test set
-    adjusted_val_size = val_size / (1 - test_size)
-    train_texts, val_texts, train_labels, val_labels = stratified_ner_split(
-        train_val_texts, train_val_labels, val_size=adjusted_val_size, random_state=random_state
-    )
+    # Check the distribution of our stratification groups
+    signature_counts = dataset['weak_entity_signature'].value_counts()
+    print("\nStratification group distribution:")
+    print(signature_counts)
     
-    return train_texts, val_texts, test_texts, train_labels, val_labels, test_labels
-
-def prepare_stratified_data_for_model(texts, labels, tokenizer, max_len, label_map=None):
-    """
-    Prepare stratified data split for the model using the existing ner_utils functions.
-    Compatible with the current implementation of ner_utils.py.
-    
-    Args:
-        texts: List of tokenized texts
-        labels: List of labels
-        tokenizer: Tokenizer from transformers
-        max_len: Maximum sequence length
-        label_map: Optional mapping from label names to indices
+    # Check if any group is too small for splitting
+    min_group_size = signature_counts.min()
+    if min_group_size < 5:  # If smallest group has fewer than 5 samples
+        print(f"\nWarning: Smallest stratification group has only {min_group_size} samples.")
+        print("Some groups might be too small for reliable splitting.")
         
-    Returns:
-        Dictionary with tokenized inputs and labels
-    """
-    from ner_ancient_swedish.utils.ner_utils import tokenize_and_align_labels
+        # For very small groups, we might need to merge them
+        if min_group_size < 2:
+            print("Some groups are too small for splitting. Implementing fallback strategy...")
+            
+            # Identify the groups that are too small
+            small_groups = signature_counts[signature_counts < 2].index.tolist()
+            
+            # Create a merged group for these
+            def merge_small_groups(signature):
+                if signature in small_groups:
+                    return "merged_rare_entities"
+                return signature
+            
+            # Apply the merging
+            dataset['weak_entity_signature'] = dataset['weak_entity_signature'].apply(merge_small_groups)
+            
+            # Print the updated distribution
+            print("\nUpdated stratification group distribution after merging small groups:")
+            print(dataset['weak_entity_signature'].value_counts())
     
-    # Create examples in the format expected by ner_utils.py
-    examples = {
-        "text": texts,
-        "labels": labels
-    }
-    
-    # Convert string labels to IDs if label_map is provided
-    if label_map is not None and isinstance(labels[0][0], str):
-        from ner_ancient_swedish.utils.ner_utils import map_labels_to_ids
-        examples = map_labels_to_ids(examples, label_map)
-    
-    # Tokenize and align labels using the existing ner_utils function
-    tokenized_inputs = tokenize_and_align_labels(examples, tokenizer, max_len)
-    
-    return tokenized_inputs
-
-def create_data_loaders_from_stratified_split(texts, labels, tokenizer, max_len, batch_size, 
-                                           val_size=0.2, test_size=0.1, label_map=None, 
-                                           random_state=42, return_class_weights=True):
-    """
-    Create data loaders for training from a stratified split of the data.
-    Compatible with the current implementation of all files.
-    
-    Args:
-        texts: List of tokenized texts
-        labels: List of labels
-        tokenizer: Tokenizer from transformers
-        max_len: Maximum sequence length
-        batch_size: Batch size for training
-        val_size: Proportion of validation set size
-        test_size: Proportion of test set size
-        label_map: Optional mapping from label names to indices
-        random_state: Random seed for reproducibility
-        return_class_weights: Whether to return class weights
-        
-    Returns:
-        train_loader, val_loader, test_loader, (class_weights if return_class_weights=True)
-    """
     # Perform stratified split
-    train_texts, val_texts, test_texts, train_labels, val_labels, test_labels = generate_stratified_data_splits(
-        texts, labels, val_size=val_size, test_size=test_size, random_state=random_state
-    )
-    
-    # Prepare data for model
-    train_inputs = prepare_stratified_data_for_model(train_texts, train_labels, tokenizer, max_len, label_map)
-    val_inputs = prepare_stratified_data_for_model(val_texts, val_labels, tokenizer, max_len, label_map)
-    test_inputs = prepare_stratified_data_for_model(test_texts, test_labels, tokenizer, max_len, label_map)
-    
-    # Convert to tensors and create datasets
-    # The model expects input_ids, attention_mask, and labels as tensors
-    train_dataset = create_tensor_dataset(train_inputs)
-    val_dataset = create_tensor_dataset(val_inputs)
-    test_dataset = create_tensor_dataset(test_inputs)
-    
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size)
-    
-    # Compute class weights if requested
-    if return_class_weights:
-        num_classes = len(label_map) if label_map else max(max([max(l) for l in train_labels if len(l) > 0], default=0), 0) + 1
-        class_weights = compute_class_weights(train_labels, num_classes=num_classes, label_map=label_map)
-        return train_loader, val_loader, test_loader, class_weights
-    else:
-        return train_loader, val_loader, test_loader
-
-def create_tensor_dataset(tokenized_inputs):
-    """
-    Convert tokenized inputs to a TensorDataset.
-    Compatible with the current implementation of eurobert_ner.py.
-    
-    Args:
-        tokenized_inputs: Dictionary with tokenized inputs and labels
-        
-    Returns:
-        TensorDataset compatible with the model
-    """
-    # Convert list of lists to padded tensors if needed
-    input_ids = tokenized_inputs["input_ids"]
-    attention_mask = tokenized_inputs["attention_mask"]
-    labels = tokenized_inputs["labels"]
-    
-    # Create a compatible dataset format for eurobert_ner.py
-    # The model expects DataLoader yielding batches with these keys
-    class NERDataset(torch.utils.data.Dataset):
-        def __init__(self, input_ids, attention_mask, labels):
-            self.input_ids = input_ids
-            self.attention_mask = attention_mask
-            self.labels = labels
-        
-        def __len__(self):
-            return len(self.input_ids)
-        
-        def __getitem__(self, idx):
-            return {
-                'input_ids': self.input_ids[idx],
-                'attention_mask': self.attention_mask[idx],
-                'labels': self.labels[idx]
-            }
-    
-    return NERDataset(input_ids, attention_mask, labels)
-
-def process_dataset_for_ner(dataset, tokenizer, max_len, label_map, 
-                           val_size=0.2, test_size=0.1, batch_size=16, 
-                           use_stratification=True, random_state=42):
-    """
-    Process a dataset for NER training using the existing ner_utils.py functions.
-    
-    Args:
-        dataset: Dataset with 'text' and 'entities' fields
-        tokenizer: Tokenizer for tokenizing text
-        max_len: Maximum sequence length
-        label_map: Mapping from label strings to indices
-        val_size: Proportion of validation set
-        test_size: Proportion of test set
-        batch_size: Batch size for training
-        use_stratification: Whether to use stratified split
-        random_state: Random seed
-        
-    Returns:
-        train_loader, val_loader, test_loader, class_weights
-    """
-    from ner_ancient_swedish.utils.ner_utils import prepare_dataset
-    
-    # Process raw dataset to extract token-level labels
-    processed_dataset = prepare_dataset(dataset)
-    
-    if use_stratification:
-        # Extract texts and labels for stratification
-        texts = [example['text'] for example in processed_dataset]
-        labels = [example['labels'] for example in processed_dataset]
-        
-        # Create data loaders with stratified split
-        return create_data_loaders_from_stratified_split(
-            texts, labels, tokenizer, max_len, batch_size, 
-            val_size, test_size, label_map, random_state
+    try:
+        train_indices, test_indices = train_test_split(
+            np.arange(len(dataset)),
+            test_size=test_size,
+            random_state=random_state,
+            stratify=dataset['weak_entity_signature']
         )
-    else:
-        # Use random split
-        from torch.utils.data import random_split
+    except ValueError as e:
+        print(f"\nError in stratification: {e}")
+        print("Falling back to a simpler stratification approach...")
         
-        # Map labels to ids
-        from ner_ancient_swedish.utils.ner_utils import map_labels_to_ids
+        # Create a simpler stratification based on presence of any weak entity
+        dataset['has_any_weak'] = (dataset['weak_entity_signature'] != "no_weak_entities").astype(int)
         
-        dataset_size = len(processed_dataset)
-        train_size = int(dataset_size * (1 - val_size - test_size))
-        val_size_abs = int(dataset_size * val_size)
-        test_size_abs = dataset_size - train_size - val_size_abs
+        # Also use the dominant entity type as additional stratification
+        dataset['strat_label'] = dataset['entity_counts'].apply(create_strat_label)
+        dataset['combined_strat'] = dataset['strat_label'] + "_" + dataset['has_any_weak'].astype(str)
         
-        # Create random split
-        train_dataset, val_dataset, test_dataset = random_split(
-            processed_dataset, 
-            [train_size, val_size_abs, test_size_abs],
-            generator=torch.Generator().manual_seed(random_state)
+        print("\nFallback stratification distribution:")
+        print(dataset['combined_strat'].value_counts())
+        
+        # Try the split with the fallback approach
+        train_indices, test_indices = train_test_split(
+            np.arange(len(dataset)),
+            test_size=test_size,
+            random_state=random_state,
+            stratify=dataset['combined_strat']
         )
-        
-        # Process each split
-        train_examples = []
-        for example in train_dataset:
-            example = map_labels_to_ids(example, label_map)
-            train_examples.append(example)
-        
-        val_examples = []
-        for example in val_dataset:
-            example = map_labels_to_ids(example, label_map)
-            val_examples.append(example)
-        
-        test_examples = []
-        for example in test_dataset:
-            example = map_labels_to_ids(example, label_map)
-            test_examples.append(example)
-        
-        # Tokenize and prepare for model
-        from ner_ancient_swedish.utils.ner_utils import tokenize_and_align_labels
-        
-        train_features = []
-        for example in train_examples:
-            train_features.append(tokenize_and_align_labels({
-                "text": example['text'],
-                "labels": example['labels']
-            }, tokenizer, max_len))
-        
-        val_features = []
-        for example in val_examples:
-            val_features.append(tokenize_and_align_labels({
-                "text": example['text'],
-                "labels": example['labels']
-            }, tokenizer, max_len))
-        
-        test_features = []
-        for example in test_examples:
-            test_features.append(tokenize_and_align_labels({
-                "text": example['text'],
-                "labels": example['labels']
-            }, tokenizer, max_len))
-        
-        # Create tensor datasets
-        train_dataset = create_combined_dataset(train_features)
-        val_dataset = create_combined_dataset(val_features)
-        test_dataset = create_combined_dataset(test_features)
-        
-        # Create data loaders
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size)
-        
-        # Compute class weights
-        train_labels = [example['labels'] for example in train_examples]
-        class_weights = compute_class_weights(train_labels, num_classes=len(label_map))
-        
-        return train_loader, val_loader, test_loader, class_weights
+    
+    # Drop the temporary columns we created
+    cols_to_drop = ['entity_counts', 'weak_entity_signature']
+    cols_to_drop.extend([f"has_{entity.replace('-', '_')}" for entity in weak_entities])
+    if 'strat_label' in dataset.columns:
+        cols_to_drop.append('strat_label')
+    if 'has_any_weak' in dataset.columns:
+        cols_to_drop.append('has_any_weak')
+    if 'combined_strat' in dataset.columns:
+        cols_to_drop.append('combined_strat')
+    
+    train_dataset = dataset.iloc[train_indices].drop(cols_to_drop, axis=1)
+    test_dataset = dataset.iloc[test_indices].drop(cols_to_drop, axis=1)
+    
+    # Print distribution statistics
+    print("\nEntity distribution in original dataset:")
+    original_counts = Counter()
+    for entities in dataset['entities']:
+        for entity in entities:
+            original_counts[entity['label']] += 1
+    
+    print("Original:", {label: original_counts.get(label, 0) for label in label_list})
+    
+    train_counts = Counter()
+    for entities in train_dataset['entities']:
+        for entity in entities:
+            train_counts[entity['label']] += 1
+    
+    test_counts = Counter()
+    for entities in test_dataset['entities']:
+        for entity in entities:
+            test_counts[entity['label']] += 1
+    
+    print("\nTrain:", {label: train_counts.get(label, 0) for label in label_list})
+    print("Test:", {label: test_counts.get(label, 0) for label in label_list})
+    
+    # Calculate and print the percentage of each entity in train and test
+    print("\nPercentage of entities in train set:")
+    for label in label_list:
+        orig_count = original_counts.get(label, 0)
+        if orig_count > 0:
+            train_percent = (train_counts.get(label, 0) / orig_count) * 100
+            test_percent = (test_counts.get(label, 0) / orig_count) * 100
+            print(f"{label}: {train_percent:.1f}% in train, {test_percent:.1f}% in test")
+    
+    # Print statistics specifically for weak entities
+    print("\nDistribution of weak entities:")
+    for entity in weak_entities:
+        orig_count = original_counts.get(entity, 0)
+        if orig_count > 0:
+            train_count = train_counts.get(entity, 0)
+            test_count = test_counts.get(entity, 0)
+            train_percent = (train_count / orig_count) * 100
+            test_percent = (test_count / orig_count) * 100
+            print(f"{entity}: {orig_count} total, {train_count} in train ({train_percent:.1f}%), {test_count} in test ({test_percent:.1f}%)")
+    
+    return train_dataset, test_dataset
 
-def create_combined_dataset(features):
-    """
-    Combine multiple tokenized features into a single dataset.
-    
-    Args:
-        features: List of tokenized features
-        
-    Returns:
-        Dataset compatible with the model
-    """
-    # Create a compatible dataset format
-    class NERDataset(torch.utils.data.Dataset):
-        def __init__(self, features):
-            self.features = features
-        
-        def __len__(self):
-            return len(self.features)
-        
-        def __getitem__(self, idx):
-            feature = self.features[idx]
-            return {
-                'input_ids': feature['input_ids'],
-                'attention_mask': feature['attention_mask'],
-                'labels': feature['labels']
-            }
-    
-    return NERDataset(features) 
+# Example usage
+def example_usage():
+    a = pd.read_csv("C:/Users/fabia/OneDrive/Documentos/GitHub/NER_Ancient_Swedish/A2_train.csv")
+    label_list = ['O', 'EVN', 'LOC', 'MSR-AREA', 'MSR-DIST', 'MSR-LEN', 'MSR-MON',
+                'MSR-OTH', 'MSR-VOL', 'MSR-WEI', 'OCC', 'ORG-COMP', 'ORG-INST',
+                'ORG-OTH', 'PER', 'SYMP', 'TME-DATE', 'TME-INTRV', 'TME-TIME', 'WRK']
+    create_stratified_train_test_split(label_list, a, weak_entity_threshold=300, test_size=0.2, random_state=42)
