@@ -19,6 +19,91 @@ def parse_entities(entities):
     return entities if isinstance(entities, list) else []
 
 
+def compute_class_weights(train_labels, num_classes=None, label_map=None, method='inverse', beta=0.999):
+    """
+    Compute class weights for imbalanced NER data.
+    
+    Args:
+        train_labels: List of label sequences from training data
+        num_classes: Number of classes (if None, will be inferred)
+        label_map: Optional mapping from label names to indices
+        method: Method for computing weights ('inverse', 'inverse_sqrt', 'balanced', 'effective_samples')
+        beta: Smoothing parameter for 'balanced' method (0 < beta < 1)
+        
+    Returns:
+        torch.FloatTensor: Class weights tensor
+    """
+    import torch
+    from collections import Counter
+    import numpy as np
+    
+    # Extract all labels
+    all_labels = []
+    for doc_labels in train_labels:
+        if len(doc_labels) == 0:
+            continue
+            
+        # Handle both string and numeric labels
+        if isinstance(doc_labels[0], str):
+            # For string labels, convert to indices if label_map is provided
+            if label_map:
+                doc_labels = [label_map.get(l, -100) for l in doc_labels]
+        
+        all_labels.extend([l for l in doc_labels if l != -100])  # Exclude padding
+    
+    # Count label occurrences
+    label_counts = Counter(all_labels)
+    
+    # Infer num_classes if not provided
+    if num_classes is None:
+        if label_map:
+            num_classes = len(label_map)
+        else:
+            num_classes = max(label_counts.keys()) + 1
+    
+    # Initialize weights
+    weights = np.zeros(num_classes)
+    
+    # For each class, compute its weight
+    for label, count in label_counts.items():
+        if 0 <= label < num_classes:  # Ensure valid label index
+            weights[label] = count
+    
+    # Replace zero counts with small value to avoid division by zero
+    weights = np.maximum(weights, 1e-6)
+    
+    # Compute weights based on the selected method
+    if method == 'inverse':
+        # Weights are inversely proportional to class frequency
+        weights = 1.0 / weights
+    
+    elif method == 'inverse_sqrt':
+        # Weights are inversely proportional to square root of class frequency
+        # Less aggressive than pure inverse
+        weights = 1.0 / np.sqrt(weights)
+    
+    elif method == 'balanced':
+        # Effective number of samples method (more balanced)
+        # Reference: "Class-Balanced Loss Based on Effective Number of Samples"
+        # by Yin Cui et al. (2019)
+        weights = (1.0 - beta) / (1.0 - beta ** weights)
+    
+    elif method == 'effective_samples':
+        # Combination of inverse frequency and effective samples
+        # Takes into account both class frequency and total dataset size
+        n_samples = sum(label_counts.values())
+        weights = n_samples / (num_classes * weights)
+    
+    else:
+        raise ValueError(f"Unknown weight calculation method: {method}")
+    
+    # Normalize weights to have a mean of 1
+    weights = weights / np.mean(weights)
+    
+    # Convert to PyTorch tensor
+    return torch.FloatTensor(weights)
+
+
 # Create a column with entity category distribution for stratification
 def get_entity_distribution(entities_list):
     counts = Counter()

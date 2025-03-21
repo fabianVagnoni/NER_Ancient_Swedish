@@ -229,6 +229,7 @@ class DiceLoss(nn.Module):
         else:
             return loss
 
+
 # Parameter calculation functions
 
 def calculate_focal_loss_params(train_labels, label_map=None, num_classes=None):
@@ -284,6 +285,7 @@ def calculate_focal_loss_params(train_labels, label_map=None, num_classes=None):
         'gamma': gamma
     }
 
+
 def calculate_label_smoothing_params(train_labels, label_map=None, num_classes=None):
     """
     Calculate optimal epsilon for Label Smoothing based on data distribution.
@@ -336,6 +338,7 @@ def calculate_label_smoothing_params(train_labels, label_map=None, num_classes=N
     
     return {'epsilon': epsilon}
 
+
 def calculate_dice_loss_params(train_labels, label_map=None, num_classes=None):
     """
     Calculate optimal smoothing parameter for Dice Loss based on data distribution.
@@ -381,60 +384,22 @@ def calculate_dice_loss_params(train_labels, label_map=None, num_classes=None):
     
     return {'smooth': smooth}
 
-def get_optimal_loss_function(train_labels, loss_type='focal', label_map=None, num_classes=None):
-    """
-    Get the optimal loss function with parameters tuned for the given data distribution.
-    
-    Args:
-        train_labels: List of label sequences from training data
-        loss_type: Type of loss function ('focal', 'dice', 'label_smoothing', or 'ce')
-        label_map: Optional mapping from label names to indices
-        num_classes: Number of classes (if None, will be inferred)
-        
-    Returns:
-        nn.Module: Loss function with optimized parameters
-    """
-    # Infer num_classes if not provided
-    if num_classes is None and label_map is not None:
-        num_classes = len(label_map)
-    
-    # Calculate parameters for each loss function
-    if loss_type == 'focal':
-        params = calculate_focal_loss_params(train_labels, label_map, num_classes)
-        print(f"Using Focal Loss with alpha={params['alpha'].tolist() if hasattr(params['alpha'], 'tolist') else params['alpha']}, gamma={params['gamma']:.2f}")
-        return FocalLoss(num_classes=num_classes, alpha=params['alpha'], gamma=params['gamma'])
-    
-    elif loss_type == 'label_smoothing':
-        params = calculate_label_smoothing_params(train_labels, label_map, num_classes)
-        print(f"Using Label Smoothing Cross Entropy with epsilon={params['epsilon']:.2f}")
-        return LabelSmoothingCrossEntropy(num_classes=num_classes, epsilon=params['epsilon'])
-    
-    elif loss_type == 'dice':
-        params = calculate_dice_loss_params(train_labels, label_map, num_classes)
-        print(f"Using Dice Loss with smooth={params['smooth']:.2f}")
-        return DiceLoss(num_classes=num_classes, smooth=params['smooth'])
-    
-    else:  # Default to cross entropy with class weights
-        from ner_ancient_swedish.utils.data_utils import compute_class_weights
-        class_weights = compute_class_weights(train_labels, num_classes=num_classes, label_map=label_map)
-        print(f"Using Cross Entropy with class weights")
-        return nn.CrossEntropyLoss(weight=class_weights, ignore_index=-100)
 
-def select_best_loss_function(train_labels, val_labels=None, label_map=None, num_classes=None):
+def calculate_weighted_ce_params(train_labels, label_map=None, num_classes=None):
     """
-    Automatically select the best loss function for the given data distribution.
+    Calculate optimal weights for Weighted Cross Entropy Loss based on data distribution.
     
     Args:
         train_labels: List of label sequences from training data
-        val_labels: Optional validation labels for additional analysis
         label_map: Optional mapping from label names to indices
         num_classes: Number of classes (if None, will be inferred)
         
     Returns:
-        nn.Module: The best loss function for the data
-        str: Name of the selected loss function
+        dict: Dictionary with optimal weights
     """
-    # Calculate class frequencies
+    from ner_ancient_swedish.utils.data_utils import compute_class_weights
+    
+    # Calculate class frequencies and determine best weighting method
     all_labels = []
     for doc_labels in train_labels:
         if len(doc_labels) == 0:
@@ -452,39 +417,35 @@ def select_best_loss_function(train_labels, val_labels=None, label_map=None, num
     label_counts = Counter(all_labels)
     
     if not label_counts:
-        # Default to cross entropy if no valid labels
-        print("No valid labels found, using Cross Entropy loss")
-        return nn.CrossEntropyLoss(ignore_index=-100), 'ce'
+        # Default weights if no valid labels
+        return {'weights': None}
     
-    # Calculate class imbalance metrics
-    total_count = sum(label_counts.values())
+    # Calculate class imbalance ratio
     most_common = label_counts.most_common(1)[0][1]
     least_common = min(label_counts.values())
     imbalance_ratio = most_common / max(1, least_common)
     
-    # Calculate distribution entropy
-    probs = [count / total_count for count in label_counts.values()]
-    entropy = -sum(p * math.log(p, 2) for p in probs)
-    max_entropy = math.log(len(label_counts), 2)
-    norm_entropy = entropy / max_entropy if max_entropy > 0 else 0
-    
-    # Decision logic for loss function selection
+    # Select weighting method based on imbalance ratio
     if imbalance_ratio > 50:  # Extreme imbalance
-        print(f"Detected extreme class imbalance (ratio: {imbalance_ratio:.2f}), using Focal Loss")
-        return get_optimal_loss_function(train_labels, loss_type='focal', 
-                                         label_map=label_map, num_classes=num_classes), 'focal'
-    
+        # For extreme imbalance, use effective samples method
+        method = 'balanced'
+        beta = 0.9999  # High beta for extreme imbalance
     elif imbalance_ratio > 10:  # Significant imbalance
-        print(f"Detected significant class imbalance (ratio: {imbalance_ratio:.2f}), using Dice Loss")
-        return get_optimal_loss_function(train_labels, loss_type='dice', 
-                                         label_map=label_map, num_classes=num_classes), 'dice'
+        # For significant imbalance, use direct inverse frequency
+        method = 'inverse'
+        beta = 0.999
+    else:  # Moderate imbalance
+        # For moderate imbalance, use square root of inverse frequency
+        method = 'inverse_sqrt'
+        beta = 0.99
     
-    elif norm_entropy < 0.7:  # Moderately imbalanced
-        print(f"Detected moderate class imbalance (entropy: {norm_entropy:.2f}), using Label Smoothing")
-        return get_optimal_loss_function(train_labels, loss_type='label_smoothing', 
-                                         label_map=label_map, num_classes=num_classes), 'label_smoothing'
+    # Compute class weights
+    weights = compute_class_weights(
+        train_labels, 
+        num_classes=num_classes, 
+        label_map=label_map,
+        method=method,
+        beta=beta
+    )
     
-    else:  # Relatively balanced
-        print(f"Data is relatively balanced (entropy: {norm_entropy:.2f}), using Cross Entropy")
-        return get_optimal_loss_function(train_labels, loss_type='ce', 
-                                         label_map=label_map, num_classes=num_classes), 'ce' 
+    return {'weights': weights, 'method': method}
