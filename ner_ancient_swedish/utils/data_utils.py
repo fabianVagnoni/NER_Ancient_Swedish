@@ -271,4 +271,10 @@ def example_usage():
     label_list = ['O', 'EVN', 'LOC', 'MSR-AREA', 'MSR-DIST', 'MSR-LEN', 'MSR-MON',
                 'MSR-OTH', 'MSR-VOL', 'MSR-WEI', 'OCC', 'ORG-COMP', 'ORG-INST',
                 'ORG-OTH', 'PER', 'SYMP', 'TME-DATE', 'TME-INTRV', 'TME-TIME', 'WRK']
-    create_stratified_train_test_split(label_list, a, weak_entity_threshold=300, test_size=0.2, random_state=42)
+    train_dataset, test_dataset = create_stratified_train_test_split(label_list, a, weak_entity_threshold=300, test_size=0.15, random_state=42)
+    print(train_dataset.shape)
+    print(train_dataset.columns)
+    print(test_dataset.shape)
+    print(test_dataset.columns)
+
+example_usage()
